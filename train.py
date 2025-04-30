@@ -5,15 +5,35 @@ import torch.nn.functional as F
 import torch.optim as optim
 import time
 
-# Transform setup
-transform = transforms.Compose([
+device = torch.device('cpu') #making sure the model isn't being trained on GPU
+
+#Transforms
+train_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,))
+])
+
+val_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize((0.5,), (0.5,))
 ])
 
 # Load data
-train_data = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-train_loader = torch.utils.data.DataLoader(train_data, batch_size=32, shuffle=True)
+train_data = datasets.CIFAR10(root='./data', train=True, download=True, transform=train_transform)
+
+train_size = int(len(train_data)*0.9) #90/10 split of training and validation images
+val_size = int(len(train_data)*0.1)
+
+train_set, val_set = torch.utils.data.random_split( #splitting the data randomly between training and validation sets
+    train_data,
+    [train_size, val_size],
+    generator=torch.Generator().manual_seed(42)
+)
+
+val_set.dataset.transform = val_transform
+
+train_loader = torch.utils.data.DataLoader(train_set, batch_size=32, shuffle=True)
+val_loader = torch.utils.data.DataLoader(val_set, batch_size=32, shuffle=True)
 
 # Model
 class TestNet(nn.Module):
@@ -36,10 +56,36 @@ class TestNet(nn.Module):
 
 model = TestNet()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
-criterion = nn.CrossEntropyLoss()
+criterion = nn.CrossEntropyLoss() #since we're using multiple categories
 
 losses = []
 start_time = time.time()
+
+#Validation accuracy checker
+def validate(model, val_loader, device):
+    model.eval()
+    val_loss = 0.0
+    correct   = 0
+    total     = 0
+
+    with torch.no_grad():
+        for data, target in val_loader:
+            data, target = data.to(device), target.to(device) #ensure we're running on cpu
+            outputs = model(data)
+
+            val_loss += F.cross_entropy(outputs, target, reduction='sum').item()
+            
+            _, predicted = torch.max(outputs.data, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
+
+    avg_loss = val_loss / total
+    accuracy = 100.0 * correct / total
+    return avg_loss, accuracy
+
+best_val_loss = float('inf')
+patience = 3
+wait = 0
 
 for epoch in range(10):
     model.train()
@@ -58,28 +104,41 @@ for epoch in range(10):
         if batch_idx % 100 == 0:
             print(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {loss.item():.4f}")
 
-        if time.time() - start_time > 60 * 60 * 4:
+        if time.time() - start_time > 60 * 60 * 4: #staying within the 4 hour training time limit
             print("Reached 4-hour training limit. Stopping.")
             break
 
-    # Optional: average loss for the epoch
+    #Checking accuracy and loss for each epoch on average    
     avg_loss = running_loss / len(train_loader)
-    print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
-
-    # Accuracy check
+    
     correct = 0
     total = 0
     model.eval()
     with torch.no_grad():
         for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            
             outputs = model(data)
             _, predicted = torch.max(outputs.data, 1)
             total += target.size(0)
             correct += (predicted == target).sum().item()
 
     accuracy = 100 * correct / total
-    print(f"Epoch {epoch+1} Training Accuracy: {accuracy:.2f}%\n")
+    print(f"\nEpoch {epoch+1} Training Accuracy: {accuracy:.2f}%, Average Loss: {avg_loss:.4f}")
 
-# Save model
+    #Checking validation set to counter overfitting early
+    val_loss, val_acc = validate(model, val_loader, device)
+    print(f"Epoch {epoch+1}: Val Acc: {val_acc:.2f}%, Val Loss: {val_loss:.4f}\n")
+
+    if val_loss < (best_val_loss-0.25): #Since the jump in loss can be miniscule, I want to make sure there's a significant jump to not trigger early stop
+        best_val_loss = val_loss
+        wait = 0
+    else:
+        wait += 1
+        if wait >= patience:
+            print("Early Stopping - Validation Loss not improving.")
+            break
+
+#Saving the model to a different file so that all weights are properly accounted for.
 torch.save(model.state_dict(), 'model.pth')
 
